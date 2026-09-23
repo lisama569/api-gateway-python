@@ -7,3 +7,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# local run artifacts
+gateway_run.log
+__pycache__/
+.pytest_cache/
