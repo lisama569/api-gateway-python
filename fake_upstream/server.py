@@ -102,12 +102,12 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
 
     async def _echo(instance: str, rest: str, request: Request):
         s = _instance_state(instance)
+        s["hits"] += 1  # 到达即计数（包括故障期返回 5xx 的请求）
         if s["fail"]:
             # 上游应用故障：返回 5xx，由网关原样透传（区别于连接失败的 502）
             return PlainTextResponse("boom", status_code=500)
         # 兼容任意网关前缀下的 /vary（末段为 vary）
         if rest.rstrip("/").endswith("vary"):
-            s["hits"] += 1
             enc = request.headers.get("accept-encoding", "")
             variant = "gzip" if "gzip" in enc else "identity"
             return JSONResponse(
@@ -127,7 +127,6 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
                     await asyncio.sleep(int(parts[idx + 1]) / 1000.0)
                 except ValueError:
                     pass
-        s["hits"] += 1
         s["active"] += 1
         try:
             await _delay(s)

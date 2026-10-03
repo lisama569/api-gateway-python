@@ -95,8 +95,8 @@ def gateway_server(make_config):
     """启动一个默认配置的网关；用例可用 custom_config 覆盖。"""
     handles: list[ServerHandle] = []
 
-    def _start(config: GatewayConfig):
-        app = create_app(config)
+    def _start(config: GatewayConfig, fail_timeout: float = 5.0):
+        app = create_app(config, fail_timeout=fail_timeout)
         port = _free_port()
         handle = ServerHandle(app, port).start()
         handles.append(handle)

@@ -27,6 +27,7 @@ def create_app(
     config: GatewayConfig | None = None,
     *,
     client: httpx.AsyncClient | None = None,
+    fail_timeout: float = 5.0,
 ) -> FastAPI:
     config = config or build_local_config()
     logger = get_logger("gateway")
@@ -36,7 +37,7 @@ def create_app(
     router = Router(config)
     gateway = Gateway(
         router=router,
-        selector=UpstreamSelector(fail_timeout=5.0),
+        selector=UpstreamSelector(fail_timeout=fail_timeout),
         limiter=RateLimiter(),
         cache=ResponseCache(),
         client=client,
@@ -99,6 +100,9 @@ def create_app(
                         cache_ttl=r.cache_ttl,
                         streaming=r.streaming,
                         timeout=r.timeout,
+                        retry=r.retry,
+                        coalesce_wait=r.coalesce_wait,
+                        half_open_probes=r.half_open_probes,
                     )
             new_config = GatewayConfig(
                 routes=tuple(routes),

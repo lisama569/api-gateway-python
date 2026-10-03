@@ -29,6 +29,22 @@ class UpstreamConfig:
 
 
 @dataclass(frozen=True)
+class RetryConfig:
+    """重试与故障转移配置（仅对幂等的安全方法生效）。
+
+    max_attempts    总尝试次数上限（含首次），1 表示不重试（默认，保持原行为）。
+    per_try_timeout 单次尝试超时；None 表示沿用路由 timeout。
+    budget          整个请求（含所有重试）的耗时上限（秒）。
+    retry_on_5xx    上游返回 5xx 时是否换实例重试（连接错误/超时总是可重试）。
+    """
+
+    max_attempts: int = 1
+    per_try_timeout: float | None = None
+    budget: float = 10.0
+    retry_on_5xx: bool = True
+
+
+@dataclass(frozen=True)
 class RouteConfig:
     """单条路由配置。"""
 
@@ -40,6 +56,11 @@ class RouteConfig:
     cache_ttl: int = 0
     streaming: bool = False
     timeout: float = 5.0
+    retry: RetryConfig | None = None
+    # 缓存未命中时同键请求合并回源的等待上限（秒）；0 表示不合并。
+    coalesce_wait: float = 10.0
+    # 熔断冷却后允许同时进入半开探测的请求数。
+    half_open_probes: int = 1
 
 
 @dataclass(frozen=True)

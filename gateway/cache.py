@@ -104,6 +104,27 @@ class ResponseCache:
         return bool(raw) and raw.strip() == "*"
 
     # ---- 变体感知 API（代理使用）----
+    def coalesce_key(
+        self,
+        route_id: str,
+        method: str,
+        path: str,
+        query: str,
+        request_headers: Headers,
+    ) -> str:
+        """合并回源用的键：基键 + 该资源已知 Vary 字段对应的请求头值。
+
+        只影响“哪些并发请求共享一次回源”，不改变缓存键与 TTL 行为。
+        """
+        base = self.base_key(route_id, method, path, query)
+        with self._lock:
+            variants = self._groups.get(base, [])
+            vary: list[str] = sorted(
+                {name for vary_set, _ in variants for name in vary_set}
+            )
+        suffix = self.variant_suffix(request_headers, vary)
+        return f"{base}|{suffix}" if suffix else base
+
     def lookup(
         self,
         route_id: str,
