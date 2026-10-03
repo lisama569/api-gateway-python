@@ -7,7 +7,14 @@ from __future__ import annotations
 
 import os
 
-from .config import GatewayConfig, RateLimitRule, RouteConfig, Strategy, UpstreamConfig
+from .config import (
+    GatewayConfig,
+    RateLimitRule,
+    RetryConfig,
+    RouteConfig,
+    Strategy,
+    UpstreamConfig,
+)
 
 
 def build_local_config(base: str | None = None) -> GatewayConfig:
@@ -25,6 +32,9 @@ def build_local_config(base: str | None = None) -> GatewayConfig:
                 strategy=Strategy.ROUND_ROBIN,
                 rate_limit=RateLimitRule(capacity=3, rate=1.0),
                 cache_ttl=3,
+                # 演示重试与故障转移：安全方法失败时换到另一实例，最多 2 次尝试
+                retry=RetryConfig(max_attempts=2, per_attempt_timeout=1.0, budget=3.0),
+                coalesce_wait=5.0,
             ),
             RouteConfig(
                 id="orders",

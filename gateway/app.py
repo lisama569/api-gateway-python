@@ -14,6 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .cache import ResponseCache
+from .coalesce import SingleFlight
 from .config import GatewayConfig, RouteConfig
 from .local_config import build_local_config
 from .logging_utils import get_logger
@@ -36,11 +37,16 @@ def create_app(
     router = Router(config)
     gateway = Gateway(
         router=router,
-        selector=UpstreamSelector(fail_timeout=5.0),
+        selector=UpstreamSelector(
+            fail_timeout=config.fail_timeout,
+            half_open_probes=config.half_open_probes,
+            logger=get_logger("gateway.upstream"),
+        ),
         limiter=RateLimiter(),
         cache=ResponseCache(),
         client=client,
         logger=logger,
+        flights=SingleFlight(logger=get_logger("gateway.coalesce")),
     )
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -99,6 +105,8 @@ def create_app(
                         cache_ttl=r.cache_ttl,
                         streaming=r.streaming,
                         timeout=r.timeout,
+                        retry=r.retry,
+                        coalesce_wait=r.coalesce_wait,
                     )
             new_config = GatewayConfig(
                 routes=tuple(routes),

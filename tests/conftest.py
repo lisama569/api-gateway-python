@@ -14,6 +14,7 @@ from gateway.app import create_app
 from gateway.config import (
     GatewayConfig,
     RateLimitRule,
+    RetryConfig,
     RouteConfig,
     Strategy,
     UpstreamConfig,
@@ -72,12 +73,16 @@ def make_config(upstream_base):
         global_limit=None,
         allowlist=frozenset(),
         blocklist=frozenset(),
+        fail_timeout=5.0,
+        half_open_probes=1,
     ) -> GatewayConfig:
         return GatewayConfig(
             routes=tuple(routes),
             global_rate_limit=global_limit,
             allowlist=allowlist,
             blocklist=blocklist,
+            fail_timeout=fail_timeout,
+            half_open_probes=half_open_probes,
         )
 
     def ups(names):
@@ -86,6 +91,7 @@ def make_config(upstream_base):
     _make.ups = ups
     _make.route = RouteConfig
     _make.rule = RateLimitRule
+    _make.retry = RetryConfig
     _make.strategy = Strategy
     return _make
 

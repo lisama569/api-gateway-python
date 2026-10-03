@@ -162,6 +162,16 @@ class ResponseCache:
                 variants.append((frozenset(vary), full_key))
         return full_key
 
+    def known_vary_fields(
+        self, route_id: str, method: str, path: str, query: str
+    ) -> list[str]:
+        """该资源当前已缓存变体声明过的 Vary 字段并集（用于回源合并键）。"""
+        base = self.base_key(route_id, method, path, query)
+        with self._lock:
+            return sorted(
+                {f for vary_set, _ in self._groups.get(base, []) for f in vary_set}
+            )
+
     # ---- 底层键值 API（单测与清理使用）----
     def get(self, key: str, now: float | None = None) -> CachedResponse | None:
         now = self._clock() if now is None else now
