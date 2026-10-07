@@ -17,11 +17,16 @@ from dataclasses import dataclass, field
 
 @dataclass
 class SharedResult:
-    """一次回源的可共享结果（成功响应或失败响应都算）。"""
+    """一次回源的可共享结果（成功响应或失败响应都算）。
+
+    req_headers 是 leader 自己请求头的小写快照（名字 -> 值），
+    供等待方按响应 Vary 字段校验“这份结果是否真与自己的请求头对得上”。
+    """
 
     status: int
     headers: list[tuple[bytes, bytes]]
     body: bytes
+    req_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

@@ -116,6 +116,58 @@ def test_vary_headers_separate_flights(make_config, gateway_server, upstream_bas
     assert _hits(upstream_base) == 2  # gzip 变体只回源一次
 
 
+# ---------- 冷启动：影响结果的请求头不一致，不得合并到同一次回源 ----------
+def test_cold_start_vary_requests_not_merged(
+    make_config, gateway_server, upstream_base, gateway_logs
+):
+    """缓存完全冷启动（无任何已缓存变体）时，并发 gzip / identity 请求
+    必须各自回源，且每个请求只能拿到与自己 accept-encoding 对得上的变体。"""
+    httpx.post(f"{upstream_base}/a/state/slow", params={"ms": 400})
+    _, start = gateway_server
+    gb = start(_cache_route(make_config, upstream_base))
+
+    def get(enc):
+        return httpx.get(f"{gb}/svc/vary", headers={"accept-encoding": enc}, timeout=10)
+
+    encs = ["gzip", "gzip", "identity", "identity"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        rs = [f.result() for f in [pool.submit(get, e) for e in encs]]
+
+    assert all(r.status_code == 200 for r in rs)
+    for r, enc in zip(rs, encs):
+        assert r.json()["variant"] == enc  # 响应变体与各自请求头一致
+    assert _hits(upstream_base) == 2  # 两个变体各自回源一次，互不套用
+    text = gateway_logs.text
+    assert text.count("role=leader decision=fetch") == 2  # 两个航班各自有 leader
+    assert "role=waiter decision=shared" in text  # 同变体的并发请求仍被合并
+
+
+# ---------- 键外的 Vary 头：共享结果校验不通过，等待方自己回源 ----------
+def test_unknown_vary_header_waiter_self_fetches(
+    make_config, gateway_server, upstream_base, gateway_logs
+):
+    """上游按 x-variant（不在合并键保守候选集内）出不同变体：冷启动并发时
+    两请求会同航班，但等待方按响应 Vary 校验发现对不上，必须自己回源，
+    不能套用 leader 的结果。"""
+    httpx.post(f"{upstream_base}/a/state/slow", params={"ms": 400})
+    _, start = gateway_server
+    gb = start(_cache_route(make_config, upstream_base))
+
+    def get(v):
+        return httpx.get(f"{gb}/svc/varyh", headers={"x-variant": v}, timeout=10)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_blue = pool.submit(get, "blue")
+        f_green = pool.submit(get, "green")
+        r_blue, r_green = f_blue.result(), f_green.result()
+
+    assert r_blue.status_code == r_green.status_code == 200
+    assert r_blue.json()["variant"] == "blue"  # 各自拿到与自己请求头匹配的响应
+    assert r_green.json()["variant"] == "green"
+    assert _hits(upstream_base) == 2  # leader 回源 + 等待方校验不通过后自己回源
+    assert "decision=vary_mismatch -> self fetch" in gateway_logs.text
+
+
 # ---------- 共享失败：等待方拿到可判断的失败，之后可重新发起 ----------
 def test_shared_failure_and_recovery(make_config, gateway_server, upstream_base):
     httpx.post(f"{upstream_base}/a/state/fail", params={"on": 1})

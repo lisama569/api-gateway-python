@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from starlette.datastructures import Headers
 
 CACHEABLE_METHODS = frozenset({"GET", "HEAD"})
+
+# 合并回源键的保守请求头集合：即使缓存里还没有任何变体（冷启动，
+# 网关不知道该资源真实的 Vary），也先按这些常见内容协商头区分航班，
+# 避免把不同变体的并发请求错误合并到同一次回源。
+DEFAULT_VARY_CANDIDATES = ("accept", "accept-encoding", "accept-language")
 HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -112,16 +117,18 @@ class ResponseCache:
         query: str,
         request_headers: Headers,
     ) -> str:
-        """合并回源用的键：基键 + 该资源已知 Vary 字段对应的请求头值。
+        """合并回源用的键：基键 + 影响结果的请求头值。
 
+        参与键的请求头 = 该资源已缓存变体声明的 Vary 字段 ∪ 保守候选集
+        （DEFAULT_VARY_CANDIDATES）。冷启动（还没有任何已缓存变体）时
+        至少按候选集区分，保证内容协商头不一致的请求不会被合并。
         只影响“哪些并发请求共享一次回源”，不改变缓存键与 TTL 行为。
         """
         base = self.base_key(route_id, method, path, query)
         with self._lock:
             variants = self._groups.get(base, [])
-            vary: list[str] = sorted(
-                {name for vary_set, _ in variants for name in vary_set}
-            )
+            known = {name for vary_set, _ in variants for name in vary_set}
+        vary = sorted(known | set(DEFAULT_VARY_CANDIDATES))
         suffix = self.variant_suffix(request_headers, vary)
         return f"{base}|{suffix}" if suffix else base
 

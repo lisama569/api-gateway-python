@@ -167,6 +167,13 @@ class Gateway:
                     "coalesce key=%s role=waiter decision=leader_aborted -> self fetch", key
                 )
                 return await self._forward(request, route, client_ip, False, True)
+            if not self._vary_compatible(result, request):
+                # 共享结果的 Vary 与本请求头对不上（如冷启动时键里还没有该字段）：
+                # 不能套用别人的结果，自己回源拿与请求头匹配的响应
+                self.logger.info(
+                    "coalesce key=%s role=waiter decision=vary_mismatch -> self fetch", key
+                )
+                return await self._forward(request, route, client_ip, False, True)
             self.logger.info(
                 "coalesce key=%s role=waiter decision=shared status=%d",
                 key, result.status,
@@ -185,10 +192,40 @@ class Gateway:
             raise
         # 先共享原始结果，再给 leader 自己的响应打标记，避免污染 waiter 副本
         self.flights.complete(
-            flight, SharedResult(resp.status_code, list(resp.headers.raw), resp.body)
+            flight,
+            SharedResult(
+                resp.status_code,
+                list(resp.headers.raw),
+                resp.body,
+                {
+                    k.decode("latin1").lower(): v.decode("latin1")
+                    for k, v in request.headers.raw
+                },
+            ),
         )
         resp.headers["x-coalesce"] = "leader"
         return resp
+
+    @staticmethod
+    def _vary_compatible(result: SharedResult, request: Request) -> bool:
+        """共享结果的 Vary 字段是否与当前请求头一致。
+
+        响应未声明 Vary 时视为可共享；Vary: * 永远不可共享；
+        否则逐字段比较 leader 与当前请求的请求头值。
+        """
+        raw_vary: str | None = None
+        for k, v in result.headers:
+            if k.lower() == b"vary":
+                raw_vary = v.decode("latin1")
+                break
+        if raw_vary is None:
+            return True
+        if raw_vary.strip() == "*":
+            return False
+        for name in (token.strip().lower() for token in raw_vary.split(",") if token.strip()):
+            if result.req_headers.get(name, "") != request.headers.get(name, ""):
+                return False
+        return True
 
     # ---- 限流 -----------------------------------------------------------
     def _check_limits(self, snap, route, client_ip):

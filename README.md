@@ -14,7 +14,7 @@
 | 访问控制 | 来源白名单、黑名单（支持 IP 与 CIDR） |
 | 缓存 | 可缓存响应按 **TTL** 缓存；支持 `If-None-Match` / `If-Modified-Since` 条件请求；缓存命中不回源 |
 | 重试/故障转移 | 安全方法（GET/HEAD/OPTIONS）可按配置重试，优先换到同路由下其它健康实例；次数/单次/整体耗时均有上限 |
-| 回源合并 | 缓存未命中时同键并发请求只放行一个回源，其余等待并共享结果（single-flight） |
+| 回源合并 | 缓存未命中时同键并发请求只放行一个回源，其余等待并共享结果（single-flight）；按影响结果的请求头区分航班，共享前按响应 Vary 校验，对不上就自己回源 |
 | 半开恢复 | 熔断冷却后用小流量探测逐步恢复，探测成功才重新参与常规分流 |
 | 透传 | 流式路由与不可缓存方法**原样透传**，不读不写缓存，不重试、不合并 |
 | 可区分失败 | 无路由 / 黑名单 / 白名单 / 限流 / 上游连接失败 / 超时 / 无健康实例，状态码与 JSON `error` 码均不同 |
@@ -91,6 +91,19 @@ curl -s http://127.0.0.1:9101/a/state   # 记下 hits
 for i in $(seq 6); do curl -s http://127.0.0.1:8000/api/users/9 & done; wait
 curl -s http://127.0.0.1:9101/a/state   # hits 只 +1（或经另一实例 +1）
 
+# 回源合并（冷启动 + 请求头不一致）：缓存里还没有该资源的任何变体时，
+# 并发 gzip 与 identity 请求不会被合并到同一次回源，各自回源、各拿各的变体
+curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=800"   # 放慢上游，制造并发窗口
+curl -s http://127.0.0.1:9101/a/state                       # 记下 hits
+Q="vary?n=$RANDOM"   # 每次换个新查询串，保证该资源冷启动（无已缓存变体）
+curl -s -H 'accept-encoding: gzip'     "http://127.0.0.1:8000/api/users/$Q" &
+curl -s -H 'accept-encoding: identity' "http://127.0.0.1:8000/api/users/$Q" &
+wait
+# 两个响应的 variant 分别是 gzip / identity（各拿各的，互不套用）；
+# 上游 a/b 的 hits 合计 +2（各自回源），网关日志可见两条 role=leader decision=fetch
+curl -s http://127.0.0.1:9101/a/state
+curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=0"
+
 # 半开恢复：a 熔断后，冷却（默认 5s）到点不会整批放回，
 # 只允许 1 个探测请求进 a；探测成功才恢复分流，日志出现 half_open_to_up
 curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=6000"
@@ -166,19 +179,28 @@ curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=0"
 
 - **适用条件**：仅可缓存请求（GET/HEAD、非流式、`cache_ttl > 0`）在**缓存未命中或刚过期**时生效；
   其余请求（不可缓存方法、流式、不同键）完全不参与合并，互不影响。
-- **键**：`route id | method | path | query | 该资源已知 Vary 字段对应的请求头值`，
+- **键**：`route id | method | path | query | 影响结果的请求头值`，
   即“路由、方法、路径、查询以及会影响结果的请求头都相同”的请求才共享一次回源。
+  参与键的请求头 = 该资源已缓存变体声明的 Vary 字段 ∪ 保守候选集
+  （`accept` / `accept-encoding` / `accept-language`，见 `cache.DEFAULT_VARY_CANDIDATES`）。
+  因此即使冷启动（还没有任何已缓存变体、网关不知道真实 Vary），
+  内容协商头不一致的请求（如 `accept-encoding: gzip` 与 `identity`）也会各自回源。
 - **行为**：第一个到达的请求成为 leader 回源；其余同键请求等待并共享其结果
   （响应头 `x-coalesce: leader/shared` 可观测）。leader 返回失败响应（如 502/504/上游 5xx）
   时同样共享，等待方各自拿到可判断的失败；leader 异常退出时等待方自己重新发起，
   不会一直挂住。
+- **共享前校验**：等待方拿到共享结果后，会按结果里的 `Vary` 字段逐一比对
+  自己的请求头与 leader 的请求头；对不上（或 `Vary: *`）说明无法安全共享，
+  该请求**自己回源**拿与请求头匹配的响应，绝不套用别人的结果
+  （日志 `coalesce ... decision=vary_mismatch -> self fetch`）。
+  这覆盖了“上游按某个不在保守候选集内的头出变体”的兜底场景。
 - **等待上限**：`RouteConfig.coalesce_wait`（默认 10s，0 表示不合并）。
   超时返回 `504 coalesce_wait_timeout`，是明确结果而非静默回源。
 - **不改变既有语义**：TTL、条件请求（304）、Vary 变体隔离都不受影响；
   不同键、可缓存与不可缓存、普通与流式请求之间绝不复用结果。
-- **边界**：缓存完全冷启动、某资源尚未缓存过任何变体时，合并键不含 Vary 头
-  （网关还不知道哪些头影响结果），此时并发不同变体请求可能共享同一次回源；
-  首个响应缓存后，后续合并键即按 Vary 精确区分。
+- **边界**：冷启动（某资源尚未缓存过任何变体）时合并键至少按保守候选集区分；
+  若上游实际按候选集之外的头出变体，则由等待方的 Vary 校验兜底，校验不通过即自己回源。
+  首个响应缓存后，其 Vary 字段并入合并键，后续同变体请求照常合并。
 
 ## 半开恢复与热更新
 
@@ -242,6 +264,8 @@ uv run pytest -q
 - 重试/故障转移：超时与 5xx 换实例重试、重试耗尽（超时/5xx 透传）、写操作不重试、
   整体预算截断、无重试配置时保持原单次行为。
 - 回源合并：同键并发只回源一次、不同键不共享、Vary 头区分合并键、
+  冷启动时 accept-encoding 不一致的并发请求各自回源、
+  键外 Vary 头校验不通过时等待方自己回源（vary_mismatch）、
   共享失败与恢复、等待超时给出 504、不可缓存方法不合并。
 - 半开恢复：冷却到期进入半开、探测名额限制、探测成功恢复/失败再熔断、
   热更新保留在途计数与半开状态、移除实例无残留。
@@ -255,7 +279,8 @@ uv run pytest -q
 ... INFO [gateway] route route=svc upstream=a reason=strategy=round_robin ... attempt=1/2 probe=False target=...
 ... INFO [gateway] retry route=svc upstream=a attempt=1 decision=retry reason=timeout was_probe=False
 ... INFO [gateway] retry route=svc decision=exhausted attempts=2 tried=a,b last=timeout
-... INFO [gateway] coalesce key=svc|GET|/svc/x| role=waiter decision=shared status=200
+... INFO [gateway] coalesce key=svc|GET|/svc/x|... role=waiter decision=shared status=200
+... INFO [gateway] coalesce key=svc|GET|/svc/varyh|... role=waiter decision=vary_mismatch -> self fetch
 ... INFO [gateway] recovery route=svc upstream=a decision=half_open_to_up
 ... INFO [gateway] rl scope=route key=users decision=deny remaining=0.00 capacity=3
 ... INFO [gateway] cache key=users|GET|/api/users/9| decision=HIT reason=fresh ttl=3
@@ -277,7 +302,9 @@ uv run pytest -q
   不重试、不合并，语义与无重试配置时完全一致。
 - 回源合并是“同键并发去重”，不是缓存：合并只发生在回源途中，结果共享后即失效，
   后续请求仍按 TTL 正常读缓存。
-- 合并键里的 Vary 头来自该资源已缓存变体；冷启动（无任何已缓存变体）时
-  不同变体的并发请求可能共享同一次回源，缓存建立后即按 Vary 精确区分。
+- 合并键里的请求头 = 已缓存变体的 Vary 字段 ∪ 保守候选集（accept/accept-encoding/
+  accept-language）；冷启动时按候选集区分，候选集之外的 Vary 头由等待方
+  共享前校验兜底，校验不通过的请求自己回源，任何请求都不会拿到
+  与自己请求头对不上的响应。
 - 半开探测名额按路由配置（`half_open_probes`，默认 1）；探测期间的实例
   不接收常规流量，恢复后才重新参与轮询/最少连接分流。

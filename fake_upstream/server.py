@@ -3,6 +3,8 @@
 所有实例由同一个 ASGI 应用承载，路径前缀 /{instance}/... 区分实例：
 - GET  /{instance}/api/users[...]   返回实例名、命中次数、可选延迟与 ETag
 - GET  /{instance}/api/orders[...]  同上（不缓存）
+- GET  /{instance}/**/*vary         按 Accept-Encoding 出变体并声明 Vary
+- GET  /{instance}/**/*varyh        按自定义头 X-Variant 出变体并声明 Vary
 - GET  /{instance}/stream           SSE 风格分块流式响应，每 0.05s 一帧
 - POST /{instance}/state/fail?on=1  全局故障开关：开启后连接层失败（用于熔断/502）
 - POST /{instance}/state/slow?ms=N  设置实例延迟（用于 504 超时）
@@ -103,6 +105,7 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
     async def _echo(instance: str, rest: str, request: Request):
         s = _instance_state(instance)
         s["hits"] += 1  # 到达即计数（包括故障期返回 5xx 的请求）
+        await _delay(s)  # 故障期间延迟同样生效，可稳定复现“慢且故障”
         if s["fail"]:
             # 上游应用故障：返回 5xx，由网关原样透传（区别于连接失败的 502）
             return PlainTextResponse("boom", status_code=500)
@@ -118,6 +121,18 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
                     "last-modified": "Mon, 22 Sep 2026 10:00:00 GMT",
                 },
             )
+        # 末段为 varyh：按自定义头 X-Variant 出不同变体（不在网关保守候选集内，
+        # 用于验证“共享结果 Vary 校验不通过 -> 等待方自己回源”的兜底路径）
+        if rest.rstrip("/").endswith("varyh"):
+            variant = request.headers.get("x-variant", "none")
+            return JSONResponse(
+                {"instance": instance, "variant": variant, "hits": s["hits"]},
+                headers={
+                    "vary": "x-variant",
+                    "etag": f'"{variant}"',
+                    "last-modified": "Mon, 22 Sep 2026 10:00:00 GMT",
+                },
+            )
         # 兼容任意路径前缀下的 slow/{ms}（网关路由前缀可能不是 /）
         parts = rest.strip("/").split("/")
         if "slow" in parts:
@@ -129,7 +144,6 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
                     pass
         s["active"] += 1
         try:
-            await _delay(s)
             payload = {
                 "instance": instance,
                 "path": rest,
