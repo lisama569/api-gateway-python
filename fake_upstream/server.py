@@ -93,6 +93,19 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
             },
         )
 
+    @app.api_route("/{instance}/vary-custom", methods=["GET"])
+    async def vary_custom(instance: str, request: Request):
+        # 依据“非标准内容协商头” X-Tenant 区分变体：
+        # 冷启动预分流（accept/accept-encoding/accept-language）不包含它，
+        # 专门用来验证“leader 回包后按 Vary 二次校验、不一致者自己回源”这条兜底链路。
+        s = _instance_state(instance)
+        s["hits"] += 1
+        tenant = request.headers.get("x-tenant", "")
+        return JSONResponse(
+            {"instance": instance, "tenant": tenant, "hits": s["hits"]},
+            headers={"vary": "x-tenant", "etag": f'"t{tenant}"'},
+        )
+
     @app.api_route(
         "/{instance}/{rest:path}",
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
@@ -103,6 +116,9 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
     async def _echo(instance: str, rest: str, request: Request):
         s = _instance_state(instance)
         s["hits"] += 1  # 到达即计数（包括故障期返回 5xx 的请求）
+        # 延迟对成功与故障响应一视同仁：让“慢且故障”的上游也能保持在途，
+        # 便于确定性复现失败结果的回源合并。
+        await _delay(s)
         if s["fail"]:
             # 上游应用故障：返回 5xx，由网关原样透传（区别于连接失败的 502）
             return PlainTextResponse("boom", status_code=500)
@@ -117,6 +133,13 @@ def create_upstream(instance: str = "x", latency: float = 0.0) -> FastAPI:
                     "etag": f'"{variant}"',
                     "last-modified": "Mon, 22 Sep 2026 10:00:00 GMT",
                 },
+            )
+        # 兼容任意网关前缀下的 /vary-custom（末段为 vary-custom，按 X-Tenant 区分）
+        if rest.rstrip("/").endswith("vary-custom"):
+            tenant = request.headers.get("x-tenant", "")
+            return JSONResponse(
+                {"instance": instance, "tenant": tenant, "hits": s["hits"]},
+                headers={"vary": "x-tenant", "etag": f'"t{tenant}"'},
             )
         # 兼容任意路径前缀下的 slow/{ms}（网关路由前缀可能不是 /）
         parts = rest.strip("/").split("/")

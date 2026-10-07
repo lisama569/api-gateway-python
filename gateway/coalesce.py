@@ -3,8 +3,10 @@
 缓存未命中（或刚好过期）时，对同一个键（路由+方法+路径+查询+影响结果的请求头）
 并发的多个请求，只允许第一个（leader）真正回源，其余（waiter）等待并共享结果。
 
-- leader 完成（无论成功还是失败响应）后，waiter 各自拿到同一份结果；
-  失败结果同样共享，等待方能拿到可判断的失败，且航班随即结束，后续请求可重新发起。
+- leader 完成（无论成功还是失败响应）后，还要拿上游响应的 Vary 做一次校验：
+  只有 waiter 与 leader 在所有 Vary 字段上的请求头值一致时才共享；不一致
+  （或 Vary: *）的 waiter 不允许套用别人的结果，自己重新回源。
+  这是防止“冷启动时尚不知道上游按哪些头区分变体”的权威防线。
 - 等待有上限（wait_timeout）：超时返回 None，由调用方给出明确结果，不会一直挂。
 - 仅作用于可缓存请求；不同键、不可缓存、流式请求互不共享。
 """
@@ -30,6 +32,44 @@ class _Flight:
     event: asyncio.Event = field(default_factory=asyncio.Event)
     result: SharedResult | None = None
     done: bool = False
+    # leader 发起回源时的请求头快照（小写键），用于回包后按 Vary 校验 waiter
+    leader_headers: dict[str, str] | None = None
+
+
+def vary_fields_of(headers: list[tuple[bytes, bytes]]) -> list[str]:
+    """从原始响应头中解析 Vary 声明的字段；Vary: * 用 ["*"] 表示。"""
+    raw = None
+    for k, v in headers:
+        if k.lower() == b"vary":
+            raw = v.decode("latin-1")
+            break
+    if raw is None:
+        return []
+    raw = raw.strip()
+    if raw == "*":
+        return ["*"]
+    return [part.strip().lower() for part in raw.split(",") if part.strip()]
+
+
+def sharing_allowed(
+    leader_headers: dict[str, str] | None,
+    waiter_headers: dict[str, str],
+    result: SharedResult,
+) -> tuple[bool, str]:
+    """按 leader 响应的 Vary 判定 waiter 能否套用该结果。
+
+    返回 (是否可共享, 原因)。Vary 未声明时，能在同一航班上即视为可共享；
+    Vary: * 一律不共享；任一 Vary 字段的请求头值与 leader 不同则不共享。
+    """
+    fields = vary_fields_of(result.headers)
+    if fields == ["*"]:
+        return False, "vary_star"
+    if leader_headers is None:
+        return False, "no_leader_headers"
+    for name in fields:
+        if waiter_headers.get(name, "") != leader_headers.get(name, ""):
+            return False, f"vary_mismatch:{name}"
+    return True, "match"
 
 
 class SingleFlight:
@@ -39,13 +79,15 @@ class SingleFlight:
         self._lock = threading.Lock()
         self._flights: dict[str, _Flight] = {}
 
-    def acquire(self, key: str) -> tuple[bool, _Flight]:
+    def acquire(
+        self, key: str, leader_headers: dict[str, str] | None = None
+    ) -> tuple[bool, _Flight]:
         """返回 (是否 leader, 航班)。leader 负责回源并 complete。"""
         with self._lock:
             flight = self._flights.get(key)
             if flight is not None:
                 return False, flight
-            flight = _Flight(key=key)
+            flight = _Flight(key=key, leader_headers=leader_headers)
             self._flights[key] = flight
             return True, flight
 

@@ -14,7 +14,7 @@
 | 访问控制 | 来源白名单、黑名单（支持 IP 与 CIDR） |
 | 缓存 | 可缓存响应按 **TTL** 缓存；支持 `If-None-Match` / `If-Modified-Since` 条件请求；缓存命中不回源 |
 | 重试/故障转移 | 安全方法（GET/HEAD/OPTIONS）可按配置重试，优先换到同路由下其它健康实例；次数/单次/整体耗时均有上限 |
-| 回源合并 | 缓存未命中时同键并发请求只放行一个回源，其余等待并共享结果（single-flight） |
+| 回源合并 | 缓存未命中时同键并发只放行一个回源；按影响结果的请求头区分，冷启动不同变体不串味，回包后再按上游 `Vary` 权威校验，不一致者自行回源（single-flight） |
 | 半开恢复 | 熔断冷却后用小流量探测逐步恢复，探测成功才重新参与常规分流 |
 | 透传 | 流式路由与不可缓存方法**原样透传**，不读不写缓存，不重试、不合并 |
 | 可区分失败 | 无路由 / 黑名单 / 白名单 / 限流 / 上游连接失败 / 超时 / 无健康实例，状态码与 JSON `error` 码均不同 |
@@ -37,7 +37,7 @@ gateway/
   local_config.py        指向本地假上游的演示配置
 fake_upstream/
   server.py              本地假上游（多实例 a/b/c、延迟、故障开关、SSE 流）
-tests/                   67 个测试（单测 + 真实本地 uvicorn 端到端）
+tests/                   72 个测试（单测 + 真实本地 uvicorn 端到端）
 ```
 
 ## 本地运行
@@ -166,19 +166,75 @@ curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=0"
 
 - **适用条件**：仅可缓存请求（GET/HEAD、非流式、`cache_ttl > 0`）在**缓存未命中或刚过期**时生效；
   其余请求（不可缓存方法、流式、不同键）完全不参与合并，互不影响。
-- **键**：`route id | method | path | query | 该资源已知 Vary 字段对应的请求头值`，
-  即“路由、方法、路径、查询以及会影响结果的请求头都相同”的请求才共享一次回源。
-- **行为**：第一个到达的请求成为 leader 回源；其余同键请求等待并共享其结果
-  （响应头 `x-coalesce: leader/shared` 可观测）。leader 返回失败响应（如 502/504/上游 5xx）
-  时同样共享，等待方各自拿到可判断的失败；leader 异常退出时等待方自己重新发起，
-  不会一直挂住。
-- **等待上限**：`RouteConfig.coalesce_wait`（默认 10s，0 表示不合并）。
-  超时返回 `504 coalesce_wait_timeout`，是明确结果而非静默回源。
+- **合并键**：`route id | method | path | query | 影响结果的请求头值`。
+  - 该资源已缓存过变体时，取这些变体响应里 `Vary` 声明字段的并集（精确）；
+  - **冷启动**（刚启动、或该资源从未缓存过任何变体，上游 `Vary` 尚未知）时，
+    先按标准内容协商头 `accept / accept-encoding / accept-language` 做**保守预分流**，
+    因此带 `accept-encoding: gzip` 和不带压缩的并发请求从一开始就落在不同航班，各自回源。
+- **回包后的权威校验（防止变体串味）**：leader 回源返回后，每个 waiter 还要拿
+  **上游响应自己声明的 `Vary`** 对一遍请求头：
+  - 所有 `Vary` 字段的请求头值都与 leader 相同 → 共享该结果（`x-coalesce: shared`）；
+  - 任一 `Vary` 字段不一致，或响应是 `Vary: *` → **绝不套用别人的变体**，
+    waiter 立即**自己回源**，拿到与自己请求头对得上的响应（`x-coalesce: self`）。
+    这条防线不依赖预分流是否覆盖了某个头：即便上游按自定义头（如 `Vary: x-tenant`）
+    区分内容、冷启动预分流里没有它，waiter 也只会在 leader 回包后被校验拦住并自行回源，
+    任何请求都不可能拿到与自己请求头不符的响应。
+  - `Vary` 之外的请求头（如 `user-agent`）不同不影响共享。
+- **回源失败**：leader 拿到的是明确失败响应（如上游 5xx）时，同航班 waiter 共享这份失败，
+  各自都能凭状态码/响应体判断失败；航班随即结束，**之后再发会重新发起回源**，
+  上游恢复后即可正常成功，不会一直失败或卡住。leader 发生连接级异常退出时，
+  waiter 拿到 `aborted` 信号后也各自自行回源。
+- **等待超时**：等待有上限 `RouteConfig.coalesce_wait`（默认 10s，`0` 表示不合并）。
+  waiter 超时拿到的是**明确的失败响应** `504 coalesce_wait_timeout`（JSON `error` 码可判断），
+  而不是静默套用别人的结果；航班本身不受影响，leader 成功后会正常写缓存，
+  稍后重试即可命中，不会一直卡在那里。
 - **不改变既有语义**：TTL、条件请求（304）、Vary 变体隔离都不受影响；
   不同键、可缓存与不可缓存、普通与流式请求之间绝不复用结果。
-- **边界**：缓存完全冷启动、某资源尚未缓存过任何变体时，合并键不含 Vary 头
-  （网关还不知道哪些头影响结果），此时并发不同变体请求可能共享同一次回源；
-  首个响应缓存后，后续合并键即按 Vary 精确区分。
+  回源合并只是“同键在途去重”，不是缓存：结果共享后航班即结束，后续仍按 TTL 正常读缓存。
+- **可观测标记**：响应头 `x-coalesce` 取值
+  `leader`（本次回源者）/ `shared`（共享了 leader 结果）/ `self`（因请求头不匹配
+  或 leader 异常而自行回源）；日志打印每个请求的
+  `coalesce key=... role=leader/waiter decision=fetch/shared/self_fetch/timeout`。
+
+### 本地复现并发合并（冷启动 / 请求头不一致 / 失败 / 超时）
+
+一键起服务后（`uv run python run_local.py`），假上游的 `/a/vary` 按 `Accept-Encoding`
+返回 `gzip` / `identity` 两个变体并声明 `Vary: accept-encoding`；
+`/a/vary-custom` 按自定义头 `X-Tenant` 区分并声明 `Vary: x-tenant`。
+用并发请求即可复现，配合假上游 `state` 里的 `hits` 判断实际回源次数：
+
+```bash
+# ① 冷启动 + 请求头不一致：压缩/不压缩各自回源，各拿各的变体（hits +2）
+for h in "gzip" "identity"; do
+  curl -s -H "accept-encoding: $h" http://127.0.0.1:8000/api/users/vary &
+done; wait
+curl -s http://127.0.0.1:9101/a/state     # 两个变体各回源一次，不会串味
+
+# ② 冷启动 + 自定义 Vary 头（不在预分流里）：回包后二次校验，不一致者自己回源
+for t in 1 2; do
+  curl -s -H "x-tenant: $t" http://127.0.0.1:8000/api/users/vary-custom &
+done; wait
+# 响应头里一个是 x-coalesce: leader，另一个是 x-coalesce: self
+
+# ③ 回源失败共享、随后恢复：4 个并发都拿到 500，但只回源一次；恢复后再发即 200
+curl -X POST "http://127.0.0.1:9101/a/state/fail?on=1"
+curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=300"
+for i in $(seq 4); do curl -si http://127.0.0.1:8000/api/users/9 & done; wait
+curl -X POST "http://127.0.0.1:9101/a/state/fail?on=0"
+curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=0"
+curl -si http://127.0.0.1:8000/api/users/9   # 重新回源成功，x-cache: MISS
+
+# ④ 等待超时：leader 回源超过 coalesce_wait，waiter 拿到明确 504，稍后再发成功
+curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=2000"
+for i in 1 2; do curl -si http://127.0.0.1:8000/api/users/9 & done; wait
+# 一个 200（leader），一个 504 {"error":"coalesce_wait_timeout"}（默认等待 10s，
+# 自动化用例里把 coalesce_wait 调到 0.2s 稳定复现）
+```
+
+> 网关 stderr 日志会同时打印每个请求选中的实例（`route route=... upstream=...`）、
+> 缓存判定（`cache key=... decision=MISS/STORE/HIT`）以及合并角色
+> （`coalesce ... role=leader/waiter decision=...`），可直接对照出
+> “哪些请求被合并、哪些各自回源、各自打到了哪个实例”。
 
 ## 半开恢复与热更新
 
@@ -221,6 +277,10 @@ curl -X POST "http://127.0.0.1:9101/a/state/slow?ms=0"
 `fake_upstream/server.py` 用一个 FastAPI 应用以路径前缀 `/{instance}/...` 模拟 a/b/c 三个实例：
 
 - `GET /{instance}/api/{...}` 与 `GET /{instance}/{...}`：回显实例名、路径、命中计数（带 ETag/Last-Modified）。
+- `GET /{instance}/vary`（任意网关前缀下 `/vary` 末段均可）：按 `Accept-Encoding` 返回
+  `gzip`/`identity` 变体并声明 `Vary: accept-encoding`，用于复现冷启动请求头不一致的合并场景。
+- `GET /{instance}/vary-custom`（任意前缀下 `/vary-custom` 末段均可）：按自定义头
+  `X-Tenant` 返回变体并声明 `Vary: x-tenant`，用于复现“预分流未覆盖、回包后二次校验自回源”。
 - `GET /{instance}/stream`：5 帧 SSE 流。
 - `GET /{instance}/slow/{ms}`：睡眠指定毫秒，用于复现超时（任意路由前缀下也识别 `slow/毫秒`）。
 - `POST /{instance}/state/fail?on=1`：让该实例返回 500。
@@ -241,8 +301,9 @@ uv run pytest -q
   不可缓存方法不写缓存。
 - 重试/故障转移：超时与 5xx 换实例重试、重试耗尽（超时/5xx 透传）、写操作不重试、
   整体预算截断、无重试配置时保持原单次行为。
-- 回源合并：同键并发只回源一次、不同键不共享、Vary 头区分合并键、
-  共享失败与恢复、等待超时给出 504、不可缓存方法不合并。
+- 回源合并：同键并发只回源一次、不同键不共享、**冷启动压缩/不压缩并发各自回源不串味**、
+  同变体并发仍合并（1 leader + N shared）、**自定义 Vary 头在回包后被二次校验、不一致者自回源**、
+  自回源后两个变体各自缓存命中、共享失败与恢复、等待超时给出 504、不可缓存方法不合并。
 - 半开恢复：冷却到期进入半开、探测名额限制、探测成功恢复/失败再熔断、
   热更新保留在途计数与半开状态、移除实例无残留。
 - 上游失败：连接拒绝 502、读超时 504、全部熔断后 503、无路由 404，断言错误码彼此可区分。
@@ -256,6 +317,7 @@ uv run pytest -q
 ... INFO [gateway] retry route=svc upstream=a attempt=1 decision=retry reason=timeout was_probe=False
 ... INFO [gateway] retry route=svc decision=exhausted attempts=2 tried=a,b last=timeout
 ... INFO [gateway] coalesce key=svc|GET|/svc/x| role=waiter decision=shared status=200
+... INFO [gateway] coalesce key=svc|GET|/svc/vary-custom||accept=*/*|accept-encoding=gzip, deflate|accept-language= role=waiter decision=self_fetch reason=vary_mismatch:x-tenant
 ... INFO [gateway] recovery route=svc upstream=a decision=half_open_to_up
 ... INFO [gateway] rl scope=route key=users decision=deny remaining=0.00 capacity=3
 ... INFO [gateway] cache key=users|GET|/api/users/9| decision=HIT reason=fresh ttl=3
@@ -275,9 +337,11 @@ uv run pytest -q
 - 缓存不做 stale-while-revalidate / 仅在 TTL 内保证新鲜；鉴权以直连客户端 IP 为准。
 - 重试仅针对幂等安全方法（GET/HEAD/OPTIONS）且非流式路由；写操作与流式请求
   不重试、不合并，语义与无重试配置时完全一致。
-- 回源合并是“同键并发去重”，不是缓存：合并只发生在回源途中，结果共享后即失效，
+- 回源合并是“同键在途去重”，不是缓存：合并只发生在回源途中，结果共享后航班即结束，
   后续请求仍按 TTL 正常读缓存。
-- 合并键里的 Vary 头来自该资源已缓存变体；冷启动（无任何已缓存变体）时
-  不同变体的并发请求可能共享同一次回源，缓存建立后即按 Vary 精确区分。
+- 合并键对“影响结果的请求头”的区分分两层：冷启动先用标准内容协商头
+  （`accept/accept-encoding/accept-language`）保守预分流；无论是否预分流命中，
+  leader 回包后都会以上游响应的 `Vary` 做权威二次校验，不一致（或 `Vary: *`）的
+  waiter 一律自己回源。因此自定义 `Vary` 头、冷启动不同变体都绝不会串味。
 - 半开探测名额按路由配置（`half_open_probes`，默认 1）；探测期间的实例
   不接收常规流量，恢复后才重新参与轮询/最少连接分流。

@@ -33,7 +33,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from .access import AccessController
 from .cache import CACHEABLE_METHODS, HOP_BY_HOP, CachedResponse, ResponseCache
-from .coalesce import SharedResult, SingleFlight
+from .coalesce import SharedResult, SingleFlight, sharing_allowed
 from .logging_utils import log_cache, log_rate_limit, log_route
 from .ratelimit import RateLimiter
 from .router import Router
@@ -140,14 +140,21 @@ class Gateway:
                 return await self._coalesced_forward(
                     key, route.coalesce_wait, request, route, client_ip
                 )
-
         return await self._forward(request, route, client_ip, streaming, cacheable)
 
     # ---- 合并回源 -------------------------------------------------------
+    @staticmethod
+    def _header_snapshot(request: Request) -> dict[str, str]:
+        """请求头转小写键快照（合并键 Vary 校验用）。"""
+        return {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in request.headers.raw
+        }
+
     async def _coalesced_forward(
         self, key: str, wait_timeout: float, request: Request, route, client_ip: str
     ) -> Response:
-        is_leader, flight = self.flights.acquire(key)
+        is_leader, flight = self.flights.acquire(key, self._header_snapshot(request))
         if not is_leader:
             result = await self.flights.wait(flight, wait_timeout)
             if result is None:
@@ -164,9 +171,25 @@ class Gateway:
             if result == "aborted":
                 # leader 异常退出：不共享、不挂起，自己重新发起一次
                 self.logger.info(
-                    "coalesce key=%s role=waiter decision=leader_aborted -> self fetch", key
+                    "coalesce key=%s role=waiter decision=leader_aborted -> self fetch",
+                    key,
                 )
-                return await self._forward(request, route, client_ip, False, True)
+                resp = await self._forward(request, route, client_ip, False, True)
+                resp.headers["x-coalesce"] = "self"
+                return resp
+            # 权威校验：上游响应声明的 Vary 必须与 waiter 自己的请求头对得上
+            allowed, why = sharing_allowed(
+                flight.leader_headers, self._header_snapshot(request), result
+            )
+            if not allowed:
+                # 不能安全共享：绝不套用别人的变体，自己回源拿与自己请求头匹配的响应
+                self.logger.info(
+                    "coalesce key=%s role=waiter decision=self_fetch reason=%s",
+                    key, why,
+                )
+                resp = await self._forward(request, route, client_ip, False, True)
+                resp.headers["x-coalesce"] = "self"
+                return resp
             self.logger.info(
                 "coalesce key=%s role=waiter decision=shared status=%d",
                 key, result.status,
@@ -175,7 +198,9 @@ class Gateway:
                 k.decode("latin1"): v.decode("latin1") for k, v in result.headers
             }
             headers["x-coalesce"] = "shared"
-            return Response(status_code=result.status, content=result.body, headers=headers)
+            return Response(
+                status_code=result.status, content=result.body, headers=headers
+            )
 
         self.logger.info("coalesce key=%s role=leader decision=fetch", key)
         try:

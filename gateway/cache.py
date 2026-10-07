@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from starlette.datastructures import Headers
 
 CACHEABLE_METHODS = frozenset({"GET", "HEAD"})
+
+# 冷启动（该资源还没缓存过任何变体、上游 Vary 未知）时，默认按标准内容协商头
+# 预先区分合并键，避免不同变体在冷启动瞬间共享同一次回源。
+# 这只是“保守预分流”，真正权威的依据仍是上游响应的 Vary（见 coalesce 的回包校验）；
+# 自定义 Vary 头即便不在此列，也会在 leader 回包后被二次校验拦住。
+COLD_START_VARY = ("accept", "accept-encoding", "accept-language")
 HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -112,16 +118,23 @@ class ResponseCache:
         query: str,
         request_headers: Headers,
     ) -> str:
-        """合并回源用的键：基键 + 该资源已知 Vary 字段对应的请求头值。
+        """合并回源用的键：基键 + 影响结果的请求头值。
 
+        - 该资源已缓存过变体：用已知 Vary 字段的并集（精确）。
+        - 冷启动（尚无任何变体，上游 Vary 未知）：用 COLD_START_VARY 里的标准
+          内容协商头做保守预分流，先把最常见的不同变体拆开，避免冷启动瞬间
+          把带/不带压缩等请求合进同一次回源。
         只影响“哪些并发请求共享一次回源”，不改变缓存键与 TTL 行为。
         """
         base = self.base_key(route_id, method, path, query)
         with self._lock:
             variants = self._groups.get(base, [])
-            vary: list[str] = sorted(
-                {name for vary_set, _ in variants for name in vary_set}
-            )
+            if variants:
+                vary: list[str] = sorted(
+                    {name for vary_set, _ in variants for name in vary_set}
+                )
+            else:
+                vary = list(COLD_START_VARY)
         suffix = self.variant_suffix(request_headers, vary)
         return f"{base}|{suffix}" if suffix else base
 
